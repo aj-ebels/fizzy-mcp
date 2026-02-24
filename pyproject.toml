@@ -25,9 +25,9 @@ dependencies = [
 fizzy-mcp = "fizzy_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/alexroubinet/fizzy-mcp"
-Repository = "https://github.com/alexroubinet/fizzy-mcp"
-Issues = "https://github.com/alexroubinet/fizzy-mcp/issues"
+Homepage = "https://github.com/alexrbzz/fizzy-mcp"
+Repository = "https://github.com/alexrbzz/fizzy-mcp"
+Issues = "https://github.com/alexrbzz/fizzy-mcp/issues"
 
 [build-system]
 requires = ["hatchling"]

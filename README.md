@@ -151,7 +151,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ## Development
 
 ```bash
-git clone https://github.com/alexroubinet/fizzy-mcp.git
+git clone https://github.com/alexrbzz/fizzy-mcp.git
 cd fizzy-mcp
 pip install -e .
 FIZZY_ACCESS_TOKEN=xxx FIZZY_ACCOUNT_SLUG=123 fizzy-mcp
