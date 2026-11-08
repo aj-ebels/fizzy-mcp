@@ -148,12 +148,32 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 |------|-------------|
 | `get_identity` | Get current user and accounts |
 
+## Pagination
+
+List tools follow Fizzy's `Link` header (`rel="next"`) and return one JSON
+array. Page length does not say whether more records exist. A successful list
+contains every page. The tool call fails, and no partial list is returned, when
+the next link is missing or unsafe, the page limit or a repeated URL is hit, or
+a page is an HTTP error or not a JSON array.
+
+Next links are requested only when they are HTTPS on the configured Fizzy host
+and stay under that list's path: the account path for account lists, and `/my/`
+for pins. Redirects are not followed. `list_cards` filters are unchanged and
+are sent on the first request. An absolute next URL is used as the server
+published it. A relative next URL keeps the filters already on the request.
+
+Write tools declare a string result. JSON bodies are returned as JSON text so
+output validation matches that type.
+
+This package depends on MCP 1.x. MCP 2 is outside the tested entrypoint.
+
 ## Development
 
 ```bash
 git clone https://github.com/alexrbzz/fizzy-mcp.git
 cd fizzy-mcp
-pip install -e .
+pip install -e '.[dev]'
+pytest
 FIZZY_ACCESS_TOKEN=xxx FIZZY_ACCOUNT_SLUG=123 fizzy-mcp
 ```
 
