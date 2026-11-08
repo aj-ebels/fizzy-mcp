@@ -5,10 +5,13 @@ Environment variables:
     FIZZY_ACCOUNT_SLUG: Account slug (numeric ID from your Fizzy URL)
 """
 
+import json
 import os
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+
+from fizzy_mcp.pagination import MAX_PAGES, ListResult, collect_pages
 
 BASE_URL = "https://app.fizzy.do"
 TOKEN = os.environ.get("FIZZY_ACCESS_TOKEN", "")
@@ -18,7 +21,8 @@ mcp = FastMCP(
     "fizzy",
     instructions=(
         "Fizzy is a Kanban board by 37signals. "
-        "Use these tools to manage boards, cards, columns, tags, comments, steps and more."
+        "Use these tools to manage boards, cards, columns, tags, comments, steps and more. "
+        "List results include completeness. Use items as the full set only when completeness is complete."
     ),
 )
 
@@ -39,6 +43,39 @@ def _url(path: str) -> str:
     return f"{BASE_URL}/{ACCOUNT_SLUG}{path}"
 
 
+def _as_text(value: object, fallback: str) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _get_list(
+    path: str,
+    params: dict | None = None,
+    continuation: str | None = None,
+    *,
+    absolute: bool = False,
+) -> ListResult:
+    """Read a paginated list, or resume one from a same-origin continuation."""
+    if continuation is not None and continuation.strip():
+        url = continuation.strip()
+        params = None
+    elif absolute:
+        url = f"{BASE_URL}{path}"
+    else:
+        url = _url(path)
+    return collect_pages(
+        url,
+        headers=_headers(),
+        origin=BASE_URL,
+        params=params,
+        max_pages=MAX_PAGES,
+    )
+
+
 def _get(path: str, params: dict | None = None):
     r = httpx.get(_url(path), headers=_headers(), params=params, follow_redirects=True)
     r.raise_for_status()
@@ -53,13 +90,13 @@ def _post(path: str, data: dict | None = None):
     location = r.headers.get("Location", "")
     if r.status_code == 201:
         try:
-            return r.json()
+            return _as_text(r.json(), f"Created. Location: {location}")
         except Exception:
             return f"Created. Location: {location}"
     if r.status_code == 204:
         return "OK"
     try:
-        return r.json()
+        return _as_text(r.json(), f"OK ({r.status_code})")
     except Exception:
         return f"OK ({r.status_code})"
 
@@ -70,7 +107,7 @@ def _put(path: str, data: dict | None = None):
     if r.status_code == 204:
         return "OK"
     try:
-        return r.json()
+        return _as_text(r.json(), f"OK ({r.status_code})")
     except Exception:
         return f"OK ({r.status_code})"
 
@@ -98,9 +135,14 @@ def get_identity() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_boards() -> list:
-    """List all boards you have access to."""
-    return _get("/boards")
+def list_boards(continuation: str | None = None) -> ListResult:
+    """List all boards you have access to.
+
+    Follows every page. completeness is complete, truncated, or error.
+    Only a complete result is the full list. Pass next as continuation
+    to resume a truncated result.
+    """
+    return _get_list("/boards", continuation=continuation)
 
 
 @mcp.tool()
@@ -164,13 +206,17 @@ def delete_board(board_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_columns(board_id: str) -> list:
+def list_columns(board_id: str, continuation: str | None = None) -> ListResult:
     """List columns on a board, sorted by position.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
 
     Args:
         board_id: The board ID.
+        continuation: next URL from a previous truncated result.
     """
-    return _get(f"/boards/{board_id}/columns")
+    return _get_list(f"/boards/{board_id}/columns", continuation=continuation)
 
 
 @mcp.tool()
@@ -240,8 +286,14 @@ def list_cards(
     terms: list[str] | None = None,
     creation: str | None = None,
     closure: str | None = None,
-) -> list:
+    continuation: str | None = None,
+) -> ListResult:
     """List cards with optional filters.
+
+    Follows every page. A short page is not the end of the list unless the
+    server omits Link rel=next. completeness is complete, truncated, or error.
+    Only a complete result is the full filtered list. Pass next as continuation
+    to resume a truncated result; that URL already includes the filters.
 
     Args:
         board_ids: Filter by board ID(s).
@@ -253,6 +305,7 @@ def list_cards(
         creation: Filter by creation period - today, yesterday, thisweek, lastweek,
                   thismonth, lastmonth, thisyear, lastyear.
         closure: Filter by closure period - same options as creation.
+        continuation: next URL from a previous truncated result.
     """
     params: dict = {"indexed_by": indexed_by, "sorted_by": sorted_by}
     if board_ids:
@@ -267,7 +320,7 @@ def list_cards(
         params["creation"] = creation
     if closure:
         params["closure"] = closure
-    return _get("/cards", params)
+    return _get_list("/cards", params, continuation)
 
 
 @mcp.tool()
@@ -416,9 +469,13 @@ def unmark_golden(card_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_tags() -> list:
-    """List all tags in the account."""
-    return _get("/tags")
+def list_tags(continuation: str | None = None) -> ListResult:
+    """List all tags in the account.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
+    """
+    return _get_list("/tags", continuation=continuation)
 
 
 @mcp.tool()
@@ -462,13 +519,17 @@ def self_assign(card_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_comments(card_number: int) -> list:
+def list_comments(card_number: int, continuation: str | None = None) -> ListResult:
     """List comments on a card (oldest first).
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
 
     Args:
         card_number: The card number.
+        continuation: next URL from a previous truncated result.
     """
-    return _get(f"/cards/{card_number}/comments")
+    return _get_list(f"/cards/{card_number}/comments", continuation=continuation)
 
 
 @mcp.tool()
@@ -521,13 +582,17 @@ def delete_comment(card_number: int, comment_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_reactions(card_number: int) -> list:
+def list_reactions(card_number: int, continuation: str | None = None) -> ListResult:
     """List reactions (boosts) on a card.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
 
     Args:
         card_number: The card number.
+        continuation: next URL from a previous truncated result.
     """
-    return _get(f"/cards/{card_number}/reactions")
+    return _get_list(f"/cards/{card_number}/reactions", continuation=continuation)
 
 
 @mcp.tool()
@@ -606,9 +671,13 @@ def delete_step(card_number: int, step_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_users() -> list:
-    """List all active users in the account."""
-    return _get("/users")
+def list_users(continuation: str | None = None) -> ListResult:
+    """List all active users in the account.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
+    """
+    return _get_list("/users", continuation=continuation)
 
 
 @mcp.tool()
@@ -626,9 +695,13 @@ def get_user(user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_notifications() -> list:
-    """List notifications for the current user. Unread first."""
-    return _get("/notifications")
+def list_notifications(continuation: str | None = None) -> ListResult:
+    """List notifications for the current user. Unread first.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
+    """
+    return _get_list("/notifications", continuation=continuation)
 
 
 @mcp.tool()
@@ -662,11 +735,13 @@ def mark_all_notifications_read() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_pins() -> list:
-    """List pinned cards for the current user (up to 100)."""
-    r = httpx.get(f"{BASE_URL}/my/pins", headers=_headers(), follow_redirects=True)
-    r.raise_for_status()
-    return r.json()
+def list_pins(continuation: str | None = None) -> ListResult:
+    """List pinned cards for the current user.
+
+    Follows every page. Only completeness "complete" is the full list.
+    Pass next as continuation to resume a truncated result.
+    """
+    return _get_list("/my/pins", continuation=continuation, absolute=True)
 
 
 @mcp.tool()
