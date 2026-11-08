@@ -150,34 +150,20 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ## Pagination
 
-List tools follow Fizzy's `Link` header (`rel="next"`) until the server stops
-sending one. Page size varies by endpoint, so the number of records in a
-response does not say whether later pages exist.
+List tools follow Fizzy's `Link` header (`rel="next"`) and return one JSON
+array. Page length does not say whether more records exist. A successful list
+contains every page. The tool call fails, and no partial list is returned, when
+the next link is missing or unsafe, the page limit or a repeated URL is hit, or
+a page is an HTTP error or not a JSON array.
 
-`list_boards`, `list_columns`, `list_cards`, `list_tags`, `list_comments`,
-`list_reactions`, `list_users`, `list_notifications`, and `list_pins` return:
+Next links are requested only when they are HTTPS on the configured Fizzy host
+and stay under that list's path: the account path for account lists, and `/my/`
+for pins. Redirects are not followed. `list_cards` filters are unchanged and
+are sent on the first request. An absolute next URL is used as the server
+published it. A relative next URL keeps the filters already on the request.
 
-| Field | Meaning |
-| --- | --- |
-| `items` | Records read so far, in server order |
-| `completeness` | `complete`, `truncated`, or `error` |
-| `next` | Same-origin URL when the result is `truncated`; otherwise `null` |
-| `error` | Why a read stopped when the result is `error`; otherwise `null` |
-
-Use `items` as the full collection only when `completeness` is `complete`.
-`truncated` means the page limit was reached (25 pages per call). Resume by
-passing `next` as `continuation`. `error` means the read stopped early, including
-an HTTP failure, a repeated page, a duplicate record, or a next link or redirect
-that left the configured HTTPS Fizzy origin. The access token is not sent to
-any other origin.
-
-`list_cards` keeps its filters (`indexed_by` values include `all`, `closed`,
-`not_now`, `stalled`, `postponing_soon`, and `golden`, plus board, tag,
-assignee, search, and date filters). Filters are sent on the first request.
-Later pages use the next link returned by the server.
-
-Write tools still declare a string result. JSON bodies are returned as JSON text
-so the declared result type matches what the tool produced.
+Write tools declare a string result. JSON bodies are returned as JSON text so
+output validation matches that type.
 
 This package depends on MCP 1.x. MCP 2 is outside the tested entrypoint.
 

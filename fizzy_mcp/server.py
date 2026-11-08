@@ -7,22 +7,27 @@ Environment variables:
 
 import json
 import os
+import posixpath
+import re
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from fizzy_mcp.pagination import MAX_PAGES, ListResult, collect_pages
-
 BASE_URL = "https://app.fizzy.do"
 TOKEN = os.environ.get("FIZZY_ACCESS_TOKEN", "")
 ACCOUNT_SLUG = os.environ.get("FIZZY_ACCOUNT_SLUG", "")
+MAX_LIST_PAGES = 25
+
+_REDIRECTS = frozenset({301, 302, 303, 307, 308})
+_NEXT_LINK = re.compile(r"<([^>]+)>\s*;\s*rel=(?:\"next\"|next)(?=[\s,;]|$)", re.IGNORECASE)
+_CLAIMS_NEXT = re.compile(r"rel=(?:\"next\"|next)(?=[\s,;]|$)", re.IGNORECASE)
 
 mcp = FastMCP(
     "fizzy",
     instructions=(
         "Fizzy is a Kanban board by 37signals. "
-        "Use these tools to manage boards, cards, columns, tags, comments, steps and more. "
-        "List results include completeness. Use items as the full set only when completeness is complete."
+        "Use these tools to manage boards, cards, columns, tags, comments, steps and more."
     ),
 )
 
@@ -52,28 +57,185 @@ def _as_text(value: object, fallback: str) -> str:
         return fallback
 
 
-def _get_list(
-    path: str,
-    params: dict | None = None,
-    continuation: str | None = None,
-    *,
-    absolute: bool = False,
-) -> ListResult:
-    """Read a paginated list, or resume one from a same-origin continuation."""
-    if continuation is not None and continuation.strip():
-        url = continuation.strip()
-        params = None
-    elif absolute:
-        url = f"{BASE_URL}{path}"
+class PaginationError(RuntimeError):
+    """List pagination stopped. The message is fixed and contains no URL."""
+
+
+def _get_list(path: str, params: dict | None = None, *, absolute: bool = False) -> list:
+    """Return every page, or raise. A partial list is never a successful result."""
+    start = f"{BASE_URL}{path}" if absolute else _url(path)
+    prefix = _list_prefix(start)
+    if not _url_allowed(start, prefix):
+        raise PaginationError("pagination link refused")
+
+    items: list = []
+    seen: set[str] = set()
+    current = start
+    current_params = params
+    for _ in range(MAX_LIST_PAGES):
+        identity = _page_identity(current, current_params)
+        if identity in seen:
+            raise PaginationError("pagination loop")
+        seen.add(identity)
+        response = _list_get(current, current_params)
+        items.extend(_page_items(response))
+        target = _next_target(response)
+        if target is None:
+            return items
+        current = _follow_next(target, str(response.url), prefix, current_params)
+        current_params = None
+    raise PaginationError("pagination page limit")
+
+
+def _list_get(url: str, params: dict | None) -> httpx.Response:
+    try:
+        response = httpx.get(
+            url,
+            headers=_headers(),
+            params=params,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError:
+        raise PaginationError("pagination request failed") from None
+    if response.status_code in _REDIRECTS:
+        raise PaginationError("pagination redirect refused")
+    if response.status_code != 200:
+        raise PaginationError("pagination request failed")
+    return response
+
+
+def _page_items(response: httpx.Response) -> list:
+    try:
+        body = response.json()
+    except ValueError:
+        raise PaginationError("pagination response was not JSON") from None
+    if not isinstance(body, list):
+        raise PaginationError("pagination response was not a JSON array")
+    return body
+
+
+def _next_target(response: httpx.Response) -> str | None:
+    raw = response.headers.get("link")
+    if not raw:
+        return None
+    if len(raw) > 8192:
+        raise PaginationError("pagination link is unusable")
+    match = _NEXT_LINK.search(raw)
+    if match:
+        target = match.group(1).strip()
+        if not target or any(char in target for char in "\r\n\t "):
+            raise PaginationError("pagination link is unusable")
+        return target
+    if _CLAIMS_NEXT.search(raw):
+        raise PaginationError("pagination link is unusable")
+    return None
+
+
+def _follow_next(target: str, current_url: str, prefix: str, params: dict | None) -> str:
+    parts = urlsplit(target)
+    if parts.scheme:
+        resolved = target
+    elif target.startswith("?") or (target.startswith("/") and not target.startswith("//")):
+        resolved = _merge_relative(target, current_url, params)
     else:
-        url = _url(path)
-    return collect_pages(
-        url,
-        headers=_headers(),
-        origin=BASE_URL,
-        params=params,
-        max_pages=MAX_PAGES,
-    )
+        raise PaginationError("pagination link refused")
+    if not _url_allowed(resolved, prefix):
+        raise PaginationError("pagination link refused")
+    return resolved
+
+
+def _merge_relative(target: str, current_url: str, params: dict | None) -> str:
+    current = urlsplit(current_url)
+    if target.startswith("?"):
+        path = current.path
+        extra = target[1:]
+    else:
+        relative = urlsplit(target)
+        path = relative.path
+        extra = relative.query
+    pairs = parse_qsl(current.query, keep_blank_values=True)
+    if params and not pairs:
+        pairs.extend(_param_pairs(params))
+    incoming = parse_qsl(extra, keep_blank_values=True)
+    replace = {key for key, _value in incoming}
+    pairs = [(key, value) for key, value in pairs if key not in replace]
+    pairs.extend(incoming)
+    netloc = current.hostname or ""
+    if current.port and not (current.scheme == "https" and current.port == 443):
+        netloc = f"{netloc}:{current.port}"
+    return urlunsplit(("https", netloc, path, urlencode(pairs, doseq=True), ""))
+
+
+def _list_prefix(url: str) -> str:
+    segments = [segment for segment in urlsplit(url).path.split("/") if segment]
+    if not segments:
+        raise PaginationError("pagination link refused")
+    return f"/{segments[0]}/"
+
+
+def _url_allowed(url: str, prefix: str) -> bool:
+    if not url or url.strip() != url or any(char in url for char in "\r\n\t "):
+        return False
+    parts = urlsplit(url)
+    if parts.username or parts.password or parts.fragment:
+        return False
+    origin = urlsplit(BASE_URL)
+    host = _hostname(parts.hostname)
+    origin_host = _hostname(origin.hostname)
+    if (
+        parts.scheme != "https"
+        or origin.scheme != "https"
+        or host is None
+        or origin_host is None
+        or host != origin_host
+        or (parts.port or 443) != (origin.port or 443)
+    ):
+        return False
+    path = _safe_path(parts.path)
+    if path is None:
+        return False
+    return path == prefix[:-1] or path.startswith(prefix)
+
+
+def _safe_path(path: str) -> str | None:
+    if "\\" in path:
+        return None
+    decoded = unquote(path)
+    if "\\" in decoded or any(segment == ".." for segment in decoded.split("/")):
+        return None
+    normalized = posixpath.normpath(decoded if decoded.startswith("/") else f"/{decoded}")
+    if not normalized.startswith("/") or normalized.startswith("//"):
+        return None
+    return normalized
+
+
+def _hostname(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return value.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+
+
+def _page_identity(url: str, params: dict | None) -> str:
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if params:
+        pairs.extend(_param_pairs(params))
+    host = _hostname(parts.hostname) or ""
+    query = urlencode(sorted(pairs), doseq=True)
+    return f"https://{host}{parts.path}?{query}"
+
+
+def _param_pairs(params: dict) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for key, value in params.items():
+        if isinstance(value, list):
+            pairs.extend((key, str(item)) for item in value)
+        elif value is not None:
+            pairs.append((key, str(value)))
+    return pairs
 
 
 def _get(path: str, params: dict | None = None):
@@ -135,14 +297,9 @@ def get_identity() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_boards(continuation: str | None = None) -> ListResult:
-    """List all boards you have access to.
-
-    Follows every page. completeness is complete, truncated, or error.
-    Only a complete result is the full list. Pass next as continuation
-    to resume a truncated result.
-    """
-    return _get_list("/boards", continuation=continuation)
+def list_boards() -> list:
+    """List all boards you have access to."""
+    return _get_list("/boards")
 
 
 @mcp.tool()
@@ -206,17 +363,13 @@ def delete_board(board_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_columns(board_id: str, continuation: str | None = None) -> ListResult:
+def list_columns(board_id: str) -> list:
     """List columns on a board, sorted by position.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
 
     Args:
         board_id: The board ID.
-        continuation: next URL from a previous truncated result.
     """
-    return _get_list(f"/boards/{board_id}/columns", continuation=continuation)
+    return _get_list(f"/boards/{board_id}/columns")
 
 
 @mcp.tool()
@@ -286,14 +439,8 @@ def list_cards(
     terms: list[str] | None = None,
     creation: str | None = None,
     closure: str | None = None,
-    continuation: str | None = None,
-) -> ListResult:
+) -> list:
     """List cards with optional filters.
-
-    Follows every page. A short page is not the end of the list unless the
-    server omits Link rel=next. completeness is complete, truncated, or error.
-    Only a complete result is the full filtered list. Pass next as continuation
-    to resume a truncated result; that URL already includes the filters.
 
     Args:
         board_ids: Filter by board ID(s).
@@ -305,7 +452,6 @@ def list_cards(
         creation: Filter by creation period - today, yesterday, thisweek, lastweek,
                   thismonth, lastmonth, thisyear, lastyear.
         closure: Filter by closure period - same options as creation.
-        continuation: next URL from a previous truncated result.
     """
     params: dict = {"indexed_by": indexed_by, "sorted_by": sorted_by}
     if board_ids:
@@ -320,7 +466,7 @@ def list_cards(
         params["creation"] = creation
     if closure:
         params["closure"] = closure
-    return _get_list("/cards", params, continuation)
+    return _get_list("/cards", params)
 
 
 @mcp.tool()
@@ -469,13 +615,9 @@ def unmark_golden(card_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_tags(continuation: str | None = None) -> ListResult:
-    """List all tags in the account.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
-    """
-    return _get_list("/tags", continuation=continuation)
+def list_tags() -> list:
+    """List all tags in the account."""
+    return _get_list("/tags")
 
 
 @mcp.tool()
@@ -519,17 +661,13 @@ def self_assign(card_number: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_comments(card_number: int, continuation: str | None = None) -> ListResult:
+def list_comments(card_number: int) -> list:
     """List comments on a card (oldest first).
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
 
     Args:
         card_number: The card number.
-        continuation: next URL from a previous truncated result.
     """
-    return _get_list(f"/cards/{card_number}/comments", continuation=continuation)
+    return _get_list(f"/cards/{card_number}/comments")
 
 
 @mcp.tool()
@@ -582,17 +720,13 @@ def delete_comment(card_number: int, comment_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_reactions(card_number: int, continuation: str | None = None) -> ListResult:
+def list_reactions(card_number: int) -> list:
     """List reactions (boosts) on a card.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
 
     Args:
         card_number: The card number.
-        continuation: next URL from a previous truncated result.
     """
-    return _get_list(f"/cards/{card_number}/reactions", continuation=continuation)
+    return _get_list(f"/cards/{card_number}/reactions")
 
 
 @mcp.tool()
@@ -671,13 +805,9 @@ def delete_step(card_number: int, step_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_users(continuation: str | None = None) -> ListResult:
-    """List all active users in the account.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
-    """
-    return _get_list("/users", continuation=continuation)
+def list_users() -> list:
+    """List all active users in the account."""
+    return _get_list("/users")
 
 
 @mcp.tool()
@@ -695,13 +825,9 @@ def get_user(user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_notifications(continuation: str | None = None) -> ListResult:
-    """List notifications for the current user. Unread first.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
-    """
-    return _get_list("/notifications", continuation=continuation)
+def list_notifications() -> list:
+    """List notifications for the current user. Unread first."""
+    return _get_list("/notifications")
 
 
 @mcp.tool()
@@ -735,13 +861,9 @@ def mark_all_notifications_read() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_pins(continuation: str | None = None) -> ListResult:
-    """List pinned cards for the current user.
-
-    Follows every page. Only completeness "complete" is the full list.
-    Pass next as continuation to resume a truncated result.
-    """
-    return _get_list("/my/pins", continuation=continuation, absolute=True)
+def list_pins() -> list:
+    """List pinned cards for the current user."""
+    return _get_list("/my/pins", absolute=True)
 
 
 @mcp.tool()
